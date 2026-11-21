@@ -1,21 +1,30 @@
 """Local HTTP API for Garp sessions and one-shot checks."""
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from datetime import timedelta
 from typing import Annotated
 from uuid import UUID
 
 import uvicorn
+from anyio import CancelScope
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
 
-from garp.executor import Reply, execute_turn, generate_title, normalize_title, openrouter_config
+from garp.executor import (
+    Reply,
+    execute_turn,
+    generate_title,
+    normalize_title,
+    openrouter_config,
+    stream_turn,
+)
 from garp.jobs import JobAccessError, JobEvidenceError, LocalJobs
 from garp.models import default_model, model_choices, validate_options
 from garp.store import NotFound, Store
@@ -23,6 +32,23 @@ from garp.worker import local_jobs
 
 _TurnExecutor = Callable[[str, str, str, list[dict], str], Awaitable[str | Reply]]
 logger = logging.getLogger(__name__)
+
+
+class _TurnStream(StreamingResponse):
+    def __init__(self, stream, release):
+        super().__init__(stream, media_type="application/x-ndjson")
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # A disconnect can occur while the iterator is suspended at a yield.
+            with CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    await self._release()
 
 
 class TurnInput(BaseModel):
@@ -121,7 +147,12 @@ def create_app(
         return {"events": result, "cursor": result[-1]["seq"] if result else after}
 
     @app.post("/v1/sessions/{session_id}/turns")
-    async def turn(session_id: UUID, body: TurnInput, owner: str = Depends(principal)):
+    async def turn(
+        session_id: UUID,
+        body: TurnInput,
+        owner: str = Depends(principal),
+        accept: Annotated[str | None, Header()] = None,
+    ):
         session = str(session_id)
         try:
             turn = await asyncio.to_thread(store.start_turn, owner, session, body.text)
@@ -129,11 +160,15 @@ def create_app(
             raise HTTPException(409, "session busy") from exc
         model = turn["model"] or default_model()
         live = executor is execute_turn
+        finished = False
 
         async def finish(text, title=None, details=None):
-            return await asyncio.to_thread(
+            nonlocal finished
+            result = await asyncio.to_thread(
                 store.finish_turn, owner, session, turn["token"], text, title, details
             )
+            finished = True
+            return result
 
         if live:
             try:
@@ -146,18 +181,115 @@ def create_app(
             except ValueError as exc:
                 await finish(None)
                 raise HTTPException(503, str(exc)) from exc
+
+        async def complete(reply):
+            text = reply.text if isinstance(reply, Reply) else reply
+            details = (
+                {
+                    "model": model,
+                    "effort": turn["effort"],
+                    "web_search": turn["web_search"],
+                }
+                if live
+                else {}
+            )
+            if isinstance(reply, Reply) and reply.sources:
+                details["sources"] = reply.sources
+            title = turn["title"]
+            try:
+                if not title and titler is not None:
+                    prompts = [
+                        entry["content"] for entry in turn["history"] if entry["role"] == "user"
+                    ]
+                    if len(prompts) < 2:
+                        async with asyncio.timeout(4):
+                            opening = prompts[0] if prompts else body.text
+                            if titler is generate_title:
+                                raw_title = await generate_title(opening, model_id=model)
+                            else:
+                                raw_title = await titler(opening)
+                            title = normalize_title(raw_title) if raw_title else None
+            except asyncio.CancelledError:
+                with CancelScope(shield=True):
+                    await finish(text, details=details)
+                raise
+            except Exception:  # noqa: BLE001 - A title failure must not lose the completed reply.
+                logger.info("Chat title generation failed")
+            with CancelScope(shield=True):
+                result = await finish(text, title, details)
+            if result is False:
+                raise HTTPException(409, "turn lease expired")
+            return {
+                "events": result,
+                "cursor": result[-1]["seq"],
+                "title": title,
+                "model": model if executor is execute_turn else None,
+            }
+
+        arguments = (owner, session, turn["token"], turn["history"], body.text)
+        options = {"model_id": model, "effort": turn["effort"], "web_search": turn["web_search"]}
+
+        if accept and any(
+            part.split(";")[0].strip().lower() == "application/x-ndjson"
+            for part in accept.split(",")
+        ):
+
+            async def release():
+                if not finished:
+                    await finish(None)
+
+            async def stream():
+                try:
+                    reply = None
+                    if live:
+                        deadline = asyncio.get_running_loop().time() + 90
+                        async with aclosing(stream_turn(*arguments, **options)) as items:
+                            while True:
+                                async with asyncio.timeout_at(deadline):
+                                    item = await anext(items, None)
+                                if item is None:
+                                    break
+                                if isinstance(item, Reply):
+                                    reply = item
+                                else:
+                                    yield json.dumps({"type": "delta", "text": item}) + "\n"
+                    else:
+                        async with asyncio.timeout(90):
+                            reply = await executor(*arguments)
+                        yield (
+                            json.dumps(
+                                {
+                                    "type": "delta",
+                                    "text": reply.text if isinstance(reply, Reply) else reply,
+                                }
+                            )
+                            + "\n"
+                        )
+                    if reply is None:
+                        raise RuntimeError("missing completed response")
+                    result = await complete(reply)
+                    yield json.dumps({"type": "done", **result}) + "\n"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - Provider errors must be sanitized.
+                    message = (
+                        "agent turn timed out"
+                        if isinstance(exc, TimeoutError)
+                        else "turn lease expired"
+                        if isinstance(exc, HTTPException) and exc.status_code == 409
+                        else "agent turn failed"
+                    )
+                    yield json.dumps({"type": "error", "message": message}) + "\n"
+
+            return _TurnStream(stream(), release)
+
         try:
             async with asyncio.timeout(90):
-                arguments = (owner, session, turn["token"], turn["history"], body.text)
-                if live:
-                    reply = await execute_turn(
-                        *arguments,
-                        model_id=model,
-                        effort=turn["effort"],
-                        web_search=turn["web_search"],
-                    )
-                else:
-                    reply = await executor(*arguments)
+                reply = (
+                    await execute_turn(*arguments, **options)
+                    if live
+                    else await executor(*arguments)
+                )
         except asyncio.CancelledError:
             await finish(None)
             raise
@@ -167,45 +299,7 @@ def create_app(
         except Exception as exc:
             await finish(None)
             raise HTTPException(502, "agent turn failed") from exc
-
-        text = reply.text if isinstance(reply, Reply) else reply
-        details = (
-            {
-                "model": model,
-                "effort": turn["effort"],
-                "web_search": turn["web_search"],
-            }
-            if live
-            else {}
-        )
-        if isinstance(reply, Reply) and reply.sources:
-            details["sources"] = reply.sources
-        title = turn["title"]
-        try:
-            if not title and titler is not None:
-                prompts = [entry["content"] for entry in turn["history"] if entry["role"] == "user"]
-                if len(prompts) < 2:
-                    async with asyncio.timeout(4):
-                        opening = prompts[0] if prompts else body.text
-                        if titler is generate_title:
-                            raw_title = await generate_title(opening, model_id=model)
-                        else:
-                            raw_title = await titler(opening)
-                        title = normalize_title(raw_title) if raw_title else None
-        except asyncio.CancelledError:
-            await finish(text, details=details)
-            raise
-        except Exception:  # noqa: BLE001 - A title failure must not lose the completed reply.
-            logger.info("Chat title generation failed")
-        result = await finish(text, title, details)
-        if result is False:
-            raise HTTPException(409, "turn lease expired")
-        return {
-            "events": result,
-            "cursor": result[-1]["seq"],
-            "title": title,
-            "model": model if executor is execute_turn else None,
-        }
+        return await complete(reply)
 
     @app.post("/v1/sessions/{session_id}/schedules", status_code=201)
     def schedule(session_id: UUID, body: ScheduleInput, owner: str = Depends(principal)):

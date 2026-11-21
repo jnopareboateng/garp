@@ -1,13 +1,5 @@
 # Garp
 
-Garp is an embeddable agent harness. This slice runs stateless Agno turns and durable one-shot job checks with a CLI and local HTTP API.
+Garp is an embeddable agent harness built on self-hosted Agno AgentOS. It supports persistent chats, streaming, independently resumable specialists, and scheduled job checks.
 
-With the [Garp services](docs/architecture.md#run-locally) running, open a saved conversation with `garp` (or `uv run --locked garp` from this checkout).
-
-To try a disposable demo:
-
-```sh
-uv run --locked garp demo
-```
-
-Type a message, then try `/check demo 5` and `/history`. The demo uses scripted replies and a real local worker and database. See the [CLI guide](docs/cli.md) for live OpenRouter mode, reopening chats, and tests.
+Run `garp` with OpenRouter configured to start a local chat. Replies stream to the terminal, and `/resume` opens saved chats. The guides cover [CLI setup](docs/cli.md), [hosting](docs/architecture.md#embed-agentos-in-a-host), and [scheduled checks](docs/scheduling.md).

@@ -15,8 +15,15 @@ from garp.store import Store
 logger = logging.getLogger(__name__)
 
 
-def run_once(store: Store, jobs: LocalJobs, clock=lambda: datetime.now(UTC)) -> bool:
-    claim = store.claim_due()
+def run_once(
+    store: Store,
+    jobs: LocalJobs,
+    clock=lambda: datetime.now(UTC),
+    *,
+    native=False,
+    session_allowed=None,
+) -> bool:
+    claim = store.claim_due(native=native) if native else store.claim_due()
     if claim is None:
         return False
 
@@ -32,8 +39,11 @@ def run_once(store: Store, jobs: LocalJobs, clock=lambda: datetime.now(UTC)) -> 
         outcome = "failed"
         evidence["state"] = "unknown"
         evidence["freshness"] = "attempts_exhausted"
+    elif session_allowed and not session_allowed(claim["session_id"], claim["owner"]):
+        outcome = "denied"
     else:
         try:
+            jobs.authorize(claim["owner"], claim["job_ref"])
             current = jobs.observe(claim["owner"], claim["job_ref"], clock())
             jobs.authorize(claim["owner"], claim["job_ref"])
         except JobAccessError:

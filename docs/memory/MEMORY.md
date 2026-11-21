@@ -17,4 +17,13 @@ Spec: https://github.com/jnopareboateng/chronicle -->
 ## Decisions
 - [garp-chat-titles](garp-chat-titles.md) — The Agno executor proposes three-word titles and Garp saves them with the turn
 - [garp-search-routing](garp-search-routing.md) — Native search needs an eligible model endpoint and a locked search engine policy
-- [garp-session-authority](garp-session-authority.md) — Garp owns committed session history and one-shot results across runtime attempts
+- [garp-session-authority](garp-session-authority.md) — AgentOS owns native chat history and Garp owns due times and committed job observations
+
+## Contracts
+- [garp-agentos-stream-reconnect](garp-agentos-stream-reconnect.md) — AgentOS SSE reconnect needs a background stream and a database on Agno 3.2.1
+- [garp-chat-deletion](garp-chat-deletion.md) — Postgres fences native chat writes and queued replays after a committed session deletion
+- [garp-delegation-boundary](garp-delegation-boundary.md) — Independent specialists use AgentOS durable runs with a reduced caller grant
+- [garp-host-identity](garp-host-identity.md) — Hosted AgentOS uses one explicit JWT trust root and a tenant-qualified subject
+- [garp-host-session-revisions](garp-host-session-revisions.md) — Postgres revision fences preserve hosted session edits against stale native saves
+- [garp-redacted-tracing](garp-redacted-tracing.md) — AgentOS trace storage is opt-in and keeps only allowlisted execution metadata
+- [garp-transcript-search](garp-transcript-search.md) — Transcript search reads completed user-visible text from owned AgentOS sessions

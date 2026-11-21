@@ -3,6 +3,8 @@
 import os
 import re
 
+from pydantic import BaseModel, ConfigDict, model_validator
+
 DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash-1017"
 MODEL_ENDPOINTS = {
     "meta/muse-ember": None,
@@ -56,6 +58,20 @@ def validate_options(model: str, effort: str | None, web_search: bool) -> str:
             "Native search requires Terra on Azure and a verified native-only workspace"
         )
     return endpoint
+
+
+class AgentSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_id: str | None = None
+    effort: str | None = None
+    web_search: bool = False
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        if self.model_id is not None:
+            validate_options(self.model_id, self.effort, self.web_search)
+        return self
 
 
 def model_choices() -> list[dict]:
