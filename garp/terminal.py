@@ -6,6 +6,10 @@ import unicodedata
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
 try:
     import readline  # noqa: F401 - Enable editing and in-process command history.
 except ImportError:
@@ -38,10 +42,58 @@ def _visible(value: str) -> str:
     )
 
 
+def _interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
+
+
 def _label(value: str) -> str:
-    if sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+    if _interactive() and "NO_COLOR" not in os.environ:
         return f"\033[1m{value}\033[0m"
     return value
+
+
+def _show_chat_header(title, model, specialist, mode):
+    details = []
+    if model and mode != "Local demo · scripted replies":
+        details.append(_visible(model))
+    if specialist and specialist != "garp":
+        details.append(f"Specialist  {_visible(specialist)}")
+    if mode:
+        details.append(mode)
+    if _interactive():
+        console = Console(highlight=False)
+        body = Text(_visible(title), style="bold")
+        for detail in details:
+            body.append(f"\n{detail}")
+        body.append("\n\n/resume  Saved chats    /help  Commands")
+        console.print()
+        console.print(
+            Panel(
+                body,
+                title="Garp",
+                title_align="left",
+                border_style="cyan",
+                width=min(console.width, 66),
+            )
+        )
+    else:
+        print(f"\nGarp  ·  {_visible(title)}")
+        for detail in details:
+            print(detail)
+        print("/resume  Saved chats    /help  Commands")
+
+
+def _show_model_choices(entries, current):
+    print(f"\n{_label('Models')}")
+    for index, entry in enumerate(entries, 1):
+        model = _visible(entry["id"])
+        if not entry["available"]:
+            suffix = "  (unavailable)"
+        elif entry["id"] == current:
+            suffix = "  (current)"
+        else:
+            suffix = ""
+        print(f"  {index}. {model}{suffix}")
 
 
 class _LegacyChatClient:
@@ -142,16 +194,8 @@ def _chat(client, session, *, demo_mode=None, model=None, native=False):
         info = client.session(session_id) if session_id else {"model": client.catalog()["default"]}
         active, after = session_id, 0
         title = info.get("title")
-        heading = _visible(title or "New chat")
-        print(f"\n{_label('Garp')}  ·  {heading}")
-        if native and (specialist := info.get("agent_id")) and specialist != "garp":
-            print(f"Specialist {_visible(specialist)}")
-        if demo_mode:
-            print(demo_mode)
-        current = info.get("model") or (client.catalog()["default"] if native else None)
-        if current and demo_mode != "Local demo · scripted replies":
-            print(_visible(current))
-        print("Type a message   /resume saved chats   /help")
+        current = info.get("model") or (catalog["default"] if native else None)
+        _show_chat_header(title or "New chat", current, info.get("agent_id"), demo_mode)
         replay()
 
     def replay(*, since=None, skip=()):
@@ -191,7 +235,8 @@ def _chat(client, session, *, demo_mode=None, model=None, native=False):
     open_chat(session, model)
     while True:
         try:
-            text = input("\nyou> ").strip()
+            prompt = "›" if _interactive() else "you>"
+            text = input(f"\n{prompt} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -311,14 +356,19 @@ def _chat(client, session, *, demo_mode=None, model=None, native=False):
                     current = (client.session(active).get("model") if active else None) or catalog[
                         "default"
                     ]
-                    for index, entry in enumerate(entries, 1):
-                        marker = "*" if entry["id"] == current else " "
-                        print(f"{marker} {index}. {_visible(entry['id'])}")
-                        if not entry["available"]:
-                            print(f"     {_visible(entry['reason'])}")
-                    print("Use /model NUMBER or /model ID to switch.")
-                    continue
-                value = parts[1]
+                    _show_model_choices(entries, current)
+                    if not _interactive():
+                        print("Use /model NUMBER or /model ID to switch.")
+                        continue
+                    try:
+                        value = input("\nModel number or ID (Enter to cancel): ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        continue
+                    if not value:
+                        continue
+                else:
+                    value = parts[1]
                 choice = next(
                     (
                         entry
@@ -330,10 +380,10 @@ def _chat(client, session, *, demo_mode=None, model=None, native=False):
                 if choice is None:
                     print("Unknown model. Use /model to see the list.")
                 elif not choice["available"]:
-                    print(_visible(choice["reason"]))
+                    print(f"{_visible(choice['reason'])}.")
                 else:
                     selected = client.set_options(active_session(), {"model": choice["id"]})
-                    print(f"Model  {_visible(selected['model'])}")
+                    print(f"{_label('Model switched to')} {_visible(selected['model'])}")
             elif text.split()[0] == "/effort":
                 parts = text.split(maxsplit=1)
                 if len(parts) == 1:
@@ -451,14 +501,35 @@ def _show_sources(data, *, show_children=True):
 def _reply(client, session_id, text, options):
     print(f"\n{_label('Garp')}", flush=True)
     started = False
+    waiting = _interactive()
+    if waiting:
+        print("Waiting for reply…", end="", flush=True)
+
+    def clear_waiting():
+        nonlocal waiting
+        if waiting:
+            print("\r\033[2K", end="", flush=True)
+            waiting = False
 
     def write_delta(delta):
         nonlocal started
+        clear_waiting()
         started = True
         print(_visible(delta), end="", flush=True)
 
+    if on_delegation := options.get("on_delegation"):
+
+        def show_delegation(child):
+            clear_waiting()
+            on_delegation(child)
+
+        options = {**options, "on_delegation": show_delegation}
+
     try:
-        turn = client.turn(session_id, text, on_delta=write_delta, **options)
+        try:
+            turn = client.turn(session_id, text, on_delta=write_delta, **options)
+        finally:
+            clear_waiting()
     except KeyboardInterrupt:
         print("\nInterrupted. Completed replies are kept in /history.")
         return None

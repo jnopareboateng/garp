@@ -12,6 +12,7 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "pyjwt[crypto]>=2.10,<3",
     "redis>=5,<8",
+    "rich>=14,<16",
 ]
 
 [project.scripts]

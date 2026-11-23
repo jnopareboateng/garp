@@ -49,7 +49,7 @@ Set `OPENROUTER_API_KEY` and `GARP_OPENROUTER_ZDR_ONLY=true` in your shell. Veri
 uv run --locked garp demo --live --model anthropic/claude-haiku-5.5
 ```
 
-Use `/model` to list presets, then `/model NUMBER` or `/model ID` to change the current chat. The selection persists when you reopen the chat. Without a saved or configured choice, new chats use DeepSeek V4.1 Flash 1017.
+Use `/model` to open the picker in an interactive terminal. Enter a model number or ID, or press Enter to keep the current model. You can also switch directly with `/model NUMBER` or `/model ID`. The selection persists when you reopen the chat. Without a saved or configured choice, new chats use DeepSeek V4.1 Flash 1017.
 
 Run `/effort` to see the levels supported by that model and `/effort high` to select one. `/effort default` restores the provider default. Xiaomi does not advertise selectable levels. Switching models resets effort and search to their defaults.
 

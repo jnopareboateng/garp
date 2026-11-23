@@ -2,7 +2,6 @@
 
 import fcntl
 import json
-import logging
 import os
 import secrets
 import shlex
@@ -27,8 +26,6 @@ from garp.jobs import LocalJobs
 from garp.models import endpoint_for
 from garp.native_client import NativeChatClient
 from garp.terminal import native_chat
-
-logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -134,9 +131,9 @@ def _serve_app(app):
         )
         api_thread.start()
         try:
-            for _ in range(500):
-                if server.started or not api_thread.is_alive():
-                    break
+            # AgentOS runs database setup before it accepts connections.
+            deadline = time.monotonic() + 45
+            while not server.started and api_thread.is_alive() and time.monotonic() < deadline:
                 time.sleep(0.02)
             if not server.started:
                 raise ValueError("The local Garp API did not start.")
@@ -173,28 +170,39 @@ def configured_jobs():
 
 
 @contextmanager
+def _quiet_runtime():
+    from agno.utils.log import agent_logger, team_logger, workflow_logger
+
+    # Uvicorn resets disabled flags and Agno changes levels during runs.
+    loggers = (agent_logger, team_logger, workflow_logger)
+
+    def suppress(_record):
+        return False
+
+    for log in loggers:
+        log.addFilter(suppress)
+    try:
+        yield
+    finally:
+        for log in loggers:
+            log.removeFilter(suppress)
+
+
+@contextmanager
 def native_workspace(*, model=None, needs_model=True):
     from garp.agentos import create_agentos_app
 
     if needs_model:
         openrouter_config(model)
     token = secrets.token_urlsafe()
-    agno_log = logging.getLogger("agno")
-
-    def warnings_only(record):
-        return record.levelno >= logging.WARNING
-
-    agno_log.addFilter(warnings_only)
-    try:
-        with (
-            _local_database() as (_, dsn),
-            _serve_app(
-                create_agentos_app(dsn, token, jobs=configured_jobs(), import_legacy=True)
-            ) as origin,
-        ):
-            yield origin, token
-    finally:
-        agno_log.removeFilter(warnings_only)
+    with (
+        _quiet_runtime(),
+        _local_database() as (_, dsn),
+        _serve_app(
+            create_agentos_app(dsn, token, jobs=configured_jobs(), import_legacy=True)
+        ) as origin,
+    ):
+        yield origin, token
 
 
 def _scripted_transport():
@@ -284,7 +292,10 @@ def demo(*, live=False, model=None):
         worker = threading.Thread(target=work, daemon=True)
         worker.start()
         try:
-            with _serve_app(create_agentos_app(dsn, token, jobs=jobs, **options)) as base:
+            with (
+                _quiet_runtime(),
+                _serve_app(create_agentos_app(dsn, token, jobs=jobs, **options)) as base,
+            ):
                 client = NativeChatClient(base, token)
                 try:
                     return native_chat(client, demo_mode=mode, model=model)

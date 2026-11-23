@@ -4,7 +4,7 @@ from garp import demo
 from garp.native_client import NativeChatClient
 
 
-def test_demo_starts_and_removes_its_workspace(postgres_dsn, tmp_path, monkeypatch):
+def test_demo_starts_and_removes_its_workspace(postgres_dsn, tmp_path, monkeypatch, capsys):
     directory = tmp_path / "demo"
     directory.mkdir(mode=0o700)
     monkeypatch.setattr(demo, "mkdtemp", lambda **_kwargs: str(directory))
@@ -46,6 +46,9 @@ def test_demo_starts_and_removes_its_workspace(postgres_dsn, tmp_path, monkeypat
 
     monkeypatch.setattr(demo, "native_chat", inspect_demo)
     assert demo.demo() == 0
+    stdout, stderr = capsys.readouterr()
+    assert "Adding AgentOS auth middleware" not in stdout + stderr
+    assert "Runtime detail redacted" not in stdout + stderr
     assert not directory.exists()
     assert len(clients) == 1 and clients[0].is_closed
 

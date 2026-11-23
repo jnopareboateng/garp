@@ -528,6 +528,7 @@ dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "redis" },
+    { name = "rich" },
 ]
 
 [package.dev-dependencies]
@@ -542,6 +543,7 @@ requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10,<3" },
     { name = "redis", specifier = ">=5,<8" },
+    { name = "rich", specifier = ">=14,<16" },
 ]
 
 [package.metadata.requires-dev]
