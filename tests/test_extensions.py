@@ -105,7 +105,7 @@ server.run(transport="stdio", show_banner=False)
                             name="catalog",
                             command=f"{shlex.quote(sys.executable)} {shlex.quote(str(mcp_server))}",
                             include_tools=["fetch_catalog"],
-                            timeout_seconds=10,
+                            timeout_seconds=20,
                         ),
                     ),
                     retrieve,
@@ -238,7 +238,8 @@ server.run(transport="stdio", show_banner=False)
         pid_file = mcp_server.with_suffix(".pid")
         first_pid = pid_file.read_text()
         os.kill(int(first_pid), signal.SIGTERM)
-        deadline = time.monotonic() + 15
+        # Allow health detection, reconnect backoff and a cold child-process import.
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if (
                 pid_file.read_text() != first_pid

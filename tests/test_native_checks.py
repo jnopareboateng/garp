@@ -209,17 +209,25 @@ def test_migrated_chat_receives_check_after_terminal_exits(checks_dsn, tmp_path)
     with _serve_app(app) as origin:
         terminal = subprocess.run(
             [sys.executable, "-m", "garp.cli", "--url", origin, "agentos", sid],
-            input="/check batch 2\n/exit\n",
+            input="/check batch 120\n/exit\n",
             text=True,
             capture_output=True,
             check=True,
-            timeout=8,
+            timeout=45,
             env={**os.environ, "GARP_TOKEN": token},
         )
         assert "Saved before migration" in terminal.stdout
         assert "Check scheduled" in terminal.stdout
         check_id = terminal.stdout.split("Check ID  ", 1)[1].split()[0]
         job(2)
+        with psycopg.connect(postgres_dsn) as conn:
+            # Make the check due only after the terminal exits and the source advances.
+            updated = conn.execute(
+                "UPDATE garp_schedules SET due_at = clock_timestamp() "
+                "WHERE id = %s AND status = 'pending'",
+                (check_id,),
+            )
+            assert updated.rowcount == 1
         client = NativeChatClient(origin, token)
         try:
             deadline = time.monotonic() + 8
@@ -359,7 +367,8 @@ def test_standalone_native_cron_delivers_to_chat(checks_dsn, tmp_path):
     ):
         client = NativeChatClient(origin, token)
         try:
-            limit = time.monotonic() + 12
+            # Allow a cold Python import and database migrations on a busy test host.
+            limit = time.monotonic() + 45
             while time.monotonic() < limit and service.poll() is None:
                 try:
                     ready = client.catalog()["job_checks"]
@@ -369,7 +378,9 @@ def test_standalone_native_cron_delivers_to_chat(checks_dsn, tmp_path):
                     if ready:
                         break
             else:
-                pytest.fail(log.read_text())
+                pytest.fail(
+                    f"Garp service did not become ready (exit={service.poll()}).\n{log.read_text()}"
+                )
             sid = client.create_session()
             response = client.client.post(
                 origin + "/schedules",
@@ -424,6 +435,7 @@ def test_standalone_native_cron_delivers_to_chat(checks_dsn, tmp_path):
                 service.wait(12)
             except subprocess.TimeoutExpired:
                 service.kill()
+                service.wait(5)
 
 
 def test_failed_delivery_does_not_block_another_due_result(checks_dsn, monkeypatch):

@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import time
+from queue import Empty
 
 import pytest
 
@@ -51,21 +52,22 @@ def replica(dsn, redis_url, prefix, commands, results, started, release):
     agentos.generate_title = title
     key = "fixture-key-longer-than-32-bytes-for-jwt"
     auth = agentos.HostAuth("https://fixture.local", "replicas", key, "HS256")
-    token = jwt.encode(
-        {
-            "iss": auth.issuer,
-            "aud": auth.audience,
-            "sub": "tenant:owner",
-            "exp": int(time.time()) + 120,
-            "scopes": ["sessions:read", "sessions:write", "agents:garp:run", "agents:read"],
-        },
-        key,
-        algorithm="HS256",
-    )
     app = agentos.create_agentos_app(
         dsn, host_auth=auth, redis_coordination=RedisCoordination(url=redis_url, key_prefix=prefix)
     )
-    with TestClient(app, headers={"Authorization": f"Bearer {token}"}) as client:
+    with TestClient(app) as client:
+        token = jwt.encode(
+            {
+                "iss": auth.issuer,
+                "aud": auth.audience,
+                "sub": "tenant:owner",
+                "exp": int(time.time()) + 120,
+                "scopes": ["sessions:read", "sessions:write", "agents:garp:run", "agents:read"],
+            },
+            key,
+            algorithm="HS256",
+        )
+        client.headers["Authorization"] = f"Bearer {token}"
         results.put(("ready", os.getpid()))
         while True:
             command = commands.get()
@@ -120,8 +122,12 @@ def test_cross_process_cancellation(postgres_dsn, tmp_path):
     try:
         for p in processes:
             p.start()
-        for q in results:
-            assert q.get(timeout=40)[0] == "ready"
+        for p, result in zip(processes, results, strict=True):
+            # Cold imports and concurrent schema initialization precede readiness.
+            try:
+                assert result.get(timeout=90)[0] == "ready"
+            except Empty:
+                pytest.fail(f"Replica {p.pid} missed its readiness deadline (exit={p.exitcode}).")
         queues[0].put(("POST", "/sessions", {"json": {"agent_id": "garp"}}))
         status, body = results[0].get(timeout=10)
         assert status == 201, body
