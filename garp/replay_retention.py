@@ -4,6 +4,7 @@ The database is the deletion authority.  This adapter only adds the
 post-commit check; native event stream behaviour remains delegated unchanged.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -27,16 +28,18 @@ class DeletedRunEventStream(BaseEventStream):
         self,
         inner: BaseEventStream,
         is_deleted: Callable[[str], Awaitable[bool]],
+        publish: Callable[[str, Any, Callable[[], Awaitable[int]]], Awaitable[int]] | None = None,
     ) -> None:
         self.inner = inner
         self.is_deleted = is_deleted
+        self.publish = publish
         self.shared = inner.shared
 
     async def _deleted(self, run_id: str, *, fail_closed: bool = True) -> bool:
         try:
             return await self.is_deleted(run_id)
         except Exception:  # noqa: BLE001 - preserve live state across transient fence failures
-            # Writes and metadata reads survive a transient fence outage; content reads fail closed.
+            # Metadata operations survive a fence outage. Content uses a separate guard.
             return fail_closed
 
     async def _check(self, run_id: str) -> bool | None:
@@ -94,6 +97,13 @@ class DeletedRunEventStream(BaseEventStream):
             await self.inner.begin_attempt(run_id, generation)
 
     async def add_event(self, run_id: str, event: Any, generation: int | None = None) -> int:
+        if self.publish is not None:
+            # The detached task retains its database lock even if its caller is cancelled.
+            task = asyncio.create_task(
+                self.publish(run_id, event, lambda: self.inner.add_event(run_id, event, generation))
+            )
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+            return await asyncio.shield(task)
         if await self._deleted(run_id, fail_closed=False):
             return -1
         index = await self.inner.add_event(run_id, event, generation)

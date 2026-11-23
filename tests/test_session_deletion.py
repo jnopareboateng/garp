@@ -1,6 +1,8 @@
 import asyncio
 import json
 import secrets
+import shutil
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
@@ -11,13 +13,15 @@ import jwt
 import psycopg
 import pytest
 from agno.db.postgres import PostgresDb
+from agno.os.event_streams.redis import RedisEventStream
 from fastapi.testclient import TestClient
 from psycopg.conninfo import conninfo_to_dict
+from redis.asyncio import Redis
 from sqlalchemy import URL
 from sqlalchemy.exc import IntegrityError
 
 from garp import agentos
-from garp.session_deletion import GarpPostgresDb
+from garp.session_deletion import GarpPostgresDb, ReplayPublicationFence
 
 
 @pytest.mark.parametrize(("background", "delegate"), [(True, False), (False, False), (False, True)])
@@ -246,6 +250,168 @@ def test_deleted_chat_tombstones_native_run_before_fk_cascade(postgres_dsn):
             assert conn.execute(
                 "SELECT 1 FROM ai.garp_deleted_runs WHERE run_id=%s", (run_id,)
             ).fetchone() == (1,)
+
+
+def test_publication_finishes_before_delete_commits(postgres_dsn, tmp_path):
+    if not shutil.which("redis-server"):
+        pytest.skip("redis-server is required")
+    socket = str(tmp_path / "redis.sock")
+    server = subprocess.Popen(
+        ["redis-server", "--port", "0", "--unixsocket", socket, "--save", "", "--appendonly", "no"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        for _ in range(100):
+            if (tmp_path / "redis.sock").exists():
+                break
+            time.sleep(0.02)
+        _check_publication_order(postgres_dsn, socket)
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+
+
+def _check_publication_order(postgres_dsn, socket):
+    token = secrets.token_urlsafe(30)
+    with TestClient(
+        agentos.create_agentos_app(postgres_dsn, token),
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
+        sid = (
+            client.post("/sessions", json={"agent_id": "garp", "user_id": "local"})
+            .raise_for_status()
+            .json()["session_id"]
+        )
+        db = GarpPostgresDb(
+            db_url=URL.create("postgresql+psycopg", query=conninfo_to_dict(postgres_dsn))
+        )
+        db.upsert_run(
+            {"run_id": "mapped-run", "run_type": "agent", "agent_id": "garp", "status": "RUNNING"},
+            sid,
+            user_id="local",
+            run_index=0,
+        )
+        guard = ReplayPublicationFence(db)
+
+        async def check():
+            entered, release = asyncio.Event(), asyncio.Event()
+            redis = Redis(unix_socket_path=socket)
+            stream = RedisEventStream(redis)
+            await stream.register_run("fresh-run")
+
+            async def mapped_publish():
+                return 42
+
+            no_session = type("Event", (), {})()
+            assert await guard("mapped-run", no_session, mapped_publish) == 42
+            mismatched = type("Event", (), {"session_id": "different-session"})()
+            assert await guard("mapped-run", mismatched, mapped_publish) == 42
+            assert await guard("unknown-run", no_session, mapped_publish) == -1
+
+            async def publish():
+                entered.set()
+                await release.wait()
+                return await stream.add_event("fresh-run", event)
+
+            event = type(
+                "Event",
+                (),
+                {
+                    "session_id": sid,
+                    "event": "Message",
+                    "to_dict": lambda self: {"event": "Message"},
+                },
+            )()
+            task = asyncio.create_task(guard("fresh-run", event, publish))
+            await asyncio.wait_for(entered.wait(), 5)
+            deletion = asyncio.create_task(asyncio.to_thread(db.delete_session, sid, "local"))
+            try:
+                for _ in range(100):
+                    with psycopg.connect(postgres_dsn, autocommit=True) as monitor:
+                        waiting = monitor.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'DELETE FROM %agno_sessions%')"
+                        ).fetchone()[0]
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.02)
+                assert waiting
+                assert not deletion.done()
+            finally:
+                release.set()
+            assert await asyncio.wait_for(task, 5) == 0
+            assert await asyncio.wait_for(deletion, 5) is True
+            assert await guard("fresh-run", event, publish) == -1
+            assert len(await stream.replay("fresh-run")) == 1
+            await redis.aclose()
+            engine = guard._loops[asyncio.get_running_loop()]["engines"][guard.url]
+            assert engine.pool.checkedin() == 1
+
+        async def checked():
+            guard.open_loop()
+            try:
+                await check()
+            finally:
+                await guard.close_loop()
+
+            async def unexpected_publish():
+                pytest.fail("A publisher started outside the AgentOS lifespan")
+
+            assert await guard("fresh-run", None, unexpected_publish) == -1
+            assert asyncio.get_running_loop() not in guard._loops
+
+        asyncio.run(checked())
+
+
+def test_publication_waits_for_uncommitted_delete(postgres_dsn):
+    token = secrets.token_urlsafe(30)
+    with TestClient(
+        agentos.create_agentos_app(postgres_dsn, token),
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
+        sid = (
+            client.post("/sessions", json={"agent_id": "garp", "user_id": "local"})
+            .raise_for_status()
+            .json()["session_id"]
+        )
+        db = GarpPostgresDb(
+            db_url=URL.create("postgresql+psycopg", query=conninfo_to_dict(postgres_dsn))
+        )
+        guard = ReplayPublicationFence(db)
+
+        async def check():
+            published = []
+
+            async def publish():
+                published.append(True)
+                return 0
+
+            event = type("Event", (), {"session_id": sid})()
+            with psycopg.connect(postgres_dsn) as conn:
+                conn.execute("DELETE FROM ai.agno_sessions WHERE session_id = %s", (sid,))
+                task = asyncio.create_task(guard("unknown-run", event, publish))
+                for _ in range(100):
+                    with psycopg.connect(postgres_dsn, autocommit=True) as monitor:
+                        waiting = monitor.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT session_id FROM %FOR KEY SHARE%')"
+                        ).fetchone()[0]
+                    if waiting:
+                        break
+                    await asyncio.sleep(0.02)
+                assert waiting
+                assert not task.done()
+                conn.commit()
+                assert await asyncio.wait_for(task, 5) == -1
+            assert not published
+
+        async def checked():
+            guard.open_loop()
+            try:
+                await check()
+            finally:
+                await guard.close_loop()
+
+        asyncio.run(checked())
 
 
 def test_host_bulk_deletion_removes_only_owned_sessions_and_tickets(postgres_dsn):

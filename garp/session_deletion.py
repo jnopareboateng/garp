@@ -1,14 +1,94 @@
 """Keep a committed AgentOS session deletion authoritative across native writers."""
 
+import asyncio
 import logging
+from threading import Lock
+from typing import ClassVar
 
 from agno.db.postgres import PostgresDb
 from psycopg import errors, sql
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import create_async_engine
 
 _SCHEMA_VERSION = "garp chat deletion v7"
 logger = logging.getLogger(__name__)
+
+
+class ReplayPublicationFence:
+    """Order Redis publication against deletion without using the native DB pool."""
+
+    _lock = Lock()
+    _loops: ClassVar[dict] = {}
+
+    def __init__(self, db):
+        self.url = db.db_engine.url
+        self.sessions = sql.Identifier(db.db_schema, db.session_table_name)
+        self.runs = sql.Identifier(db.db_schema, db.runs_table_name)
+        self.jobs = sql.Identifier(db.db_schema, db.job_table_name)
+        self.deleted_runs = sql.Identifier(db.db_schema, "garp_deleted_runs")
+        self.query = text(
+            f"SELECT session_id FROM {self.sessions.as_string()} "
+            f"WHERE session_id = COALESCE((SELECT session_id FROM {self.runs.as_string()} "
+            f"WHERE run_id = :run_id), (SELECT session_id FROM {self.jobs.as_string()} "
+            "WHERE id = :run_id), :session_id) "
+            f"AND NOT EXISTS (SELECT 1 FROM {self.deleted_runs.as_string()} WHERE run_id = :run_id) "
+            "FOR KEY SHARE"
+        )
+
+    @classmethod
+    def open_loop(cls):
+        loop = asyncio.get_running_loop()
+        with cls._lock:
+            state = cls._loops.setdefault(loop, {"refs": 0, "engines": {}, "tasks": set()})
+            state["refs"] += 1
+
+    @classmethod
+    async def close_loop(cls):
+        loop = asyncio.get_running_loop()
+        with cls._lock:
+            state = cls._loops.get(loop)
+            if state is None:
+                return
+            state["refs"] = max(0, state["refs"] - 1)
+            if state["refs"]:
+                return
+            cls._loops.pop(loop)
+        if state["tasks"]:
+            await asyncio.gather(*state["tasks"], return_exceptions=True)
+        for engine in state["engines"].values():
+            await engine.dispose()
+
+    async def __call__(self, run_id, event, publish):
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            state = self._loops.get(loop)
+            if state is None:
+                return -1
+            engine = state["engines"].get(self.url)
+            if engine is None:
+                engine = create_async_engine(
+                    self.url,
+                    pool_size=8,
+                    max_overflow=0,
+                    pool_timeout=5,
+                    connect_args={"connect_timeout": 5},
+                )
+                state["engines"][self.url] = engine
+            task = asyncio.current_task()
+            state["tasks"].add(task)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+                row = await conn.execute(
+                    self.query, {"session_id": getattr(event, "session_id", None), "run_id": run_id}
+                )
+                if row.first() is None:
+                    return -1
+                # A disconnected or timed-out Redis write may still complete server-side.
+                return await asyncio.wait_for(publish(), timeout=10)
+        finally:
+            state["tasks"].discard(task)
 
 
 class DeletedRun(RuntimeError):

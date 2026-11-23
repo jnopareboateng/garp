@@ -49,7 +49,7 @@ from garp.observability import configure_observability
 from garp.recurring_checks import HostedCheckExecutor, attach_recurring_checks, run_scheduler
 from garp.replay_retention import DeletedRunEventStream
 from garp.scheduled_prompts import PromptScheduleExecutor, ScheduledPrompts
-from garp.session_deletion import DeletedRun, install_session_deletion
+from garp.session_deletion import DeletedRun, ReplayPublicationFence, install_session_deletion
 from garp.session_deletion import GarpPostgresDb as PostgresDb
 from garp.store import Store
 from garp.transcript_search import attach_transcript_search, transcript_tool
@@ -161,6 +161,7 @@ def create_agentos_app(
 
     @asynccontextmanager
     async def lifespan(_app):
+        ReplayPublicationFence.open_loop()
         stop = asyncio.Event()
         worker = None
         try:
@@ -191,7 +192,10 @@ def create_agentos_app(
                     stop.set()
                     await worker
             finally:
-                await client.aclose()
+                try:
+                    await client.aclose()
+                finally:
+                    await ReplayPublicationFence.close_loop()
 
     def model_for(settings, admitted_default=None):
         model_id = settings.model_id or admitted_default or default_model()
@@ -451,7 +455,7 @@ def create_agentos_app(
     async def deleted_run(run_id):
         return await asyncio.to_thread(db.deleted_run, run_id)
 
-    set_event_stream(DeletedRunEventStream(native_stream, deleted_run))
+    set_event_stream(DeletedRunEventStream(native_stream, deleted_run, ReplayPublicationFence(db)))
     app = agent_os.get_app()
     if host_auth:
         attach_host_session_updates(app, db)

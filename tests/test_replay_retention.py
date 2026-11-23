@@ -98,6 +98,34 @@ def test_post_publish_deletion_cleans_buffer():
     asyncio.run(check())
 
 
+def test_cancelled_publisher_finishes_before_guard_releases():
+    async def check():
+        inner = InMemoryEventStream()
+        await inner.register_run("cancelled")
+        entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def guard(_run_id, _event, publish):
+            entered.set()
+            await release.wait()
+            try:
+                return await publish()
+            finally:
+                finished.set()
+
+        stream = DeletedRunEventStream(inner, lambda run_id: _deleted(set(), run_id), guard)
+        task = asyncio.create_task(stream.add_event("cancelled", Event()))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not finished.is_set()
+        release.set()
+        await asyncio.wait_for(finished.wait(), 2)
+        assert len(await inner.replay("cancelled")) == 1
+
+    asyncio.run(check())
+
+
 def test_tail_deletion_and_fence_outage_are_visible():
     async def check():
         inner = InMemoryEventStream()
